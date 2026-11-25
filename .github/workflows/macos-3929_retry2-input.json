@@ -1,0 +1,12 @@
+{
+  "asset_id": 793611353,
+  "kind": "source",
+  "name": "native-input.bin",
+  "release_id": 458775617,
+  "repository": "kanarskianton1/SortAI-Photo-Releases",
+  "schema": 1,
+  "sha256": "3c3e1c9e805340df780b2203f4607e61aef37051fa06d195ca3cbcaf60712806",
+  "size": 2354979,
+  "tag": "relay-input-macos-3929_retry2-31548178d6b7",
+  "target_commitish": "569bf37a27a2e6b5710c31fe7a734ee094850c0a"
+}
