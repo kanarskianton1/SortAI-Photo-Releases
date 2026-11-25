@@ -45,13 +45,6 @@ def require(condition):
     if not condition:
         raise ValueError('Relay validation failed.')
 
-def phase(label, operation, *args):
-    print(label, flush=True)
-    try:
-        return operation(*args)
-    except Exception:
-        raise RelayFailure(label) from None
-
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -76,33 +69,6 @@ def run_context():
     temp = Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
     require(temp.is_dir())
     return (temp, int(run_id), int(attempt), commit)
-
-def receive(secret, destination):
-    require(0 < len(secret) <= 16000)
-    info = parse_object(secret, {'url', 'sha256', 'key'})
-    require(matches(info['key'], '[a-fA-F0-9]{64}'))
-    fetch_asset(info, destination, MAX_ENCRYPTED)
-    return bytes.fromhex(info['key'])
-
-def fetch_asset(info, destination, limit):
-    require(matches(info['sha256'], '[a-f0-9]{64}') and isinstance(info['url'], str) and (not any((ord(char) < 33 for char in info['url']))))
-    size = info.get('size')
-    require(size is None or (type(size) is int and 28 < size <= limit))
-    target = urllib.parse.urlsplit(info['url'])
-    require(target.scheme == 'https' and target.hostname in CDN_HOSTS and (target.port in (None, 443)) and (target.username is None) and (target.password is None) and bool(target.query) and (not target.fragment))
-    request = urllib.request.Request(info['url'], headers={'Accept-Encoding': 'identity', 'User-Agent': 'SortAI-Native-Relay'})
-    received = 0
-    digest = hashlib.sha256()
-    with urllib.request.build_opener(NoRedirect()).open(request, timeout=60) as response:
-        declared = response.headers.get('Content-Length')
-        require(response.status == 200 and response.headers.get('Content-Encoding') in (None, 'identity') and (declared is None or (declared.isdecimal() and 28 < int(declared) <= limit)))
-        with destination.open('xb') as output:
-            while (chunk := response.read(CHUNK)):
-                received += len(chunk)
-                require(received <= limit)
-                digest.update(chunk)
-                output.write(chunk)
-    require(28 < received and (declared is None or received == int(declared)) and (size is None or size == received) and (digest.hexdigest() == info['sha256']))
 
 def decrypt(encrypted, decrypted, key):
     size = encrypted.stat().st_size
@@ -179,6 +145,81 @@ def file_digest(path):
     require(path.is_file() and (not path.is_symlink()))
     with path.open('rb') as source:
         return hashlib.file_digest(source, 'sha256').hexdigest()
+'Resolve the exact public encrypted-input mirror with the job token at runtime.'
+import urllib.error
+MIRROR_FILE = 'lightbox_diag3927_mirror.json'
+MIRROR_VERIFIED = {}
+LAST_FAILURE = {}
+
+def phase(label, operation, *args):
+    print(label, flush=True)
+    try:
+        return operation(*args)
+    except Exception as error:
+        if not isinstance(error, RelayFailure) or not LAST_FAILURE:
+            status = getattr(error, 'code', None)
+            LAST_FAILURE.clear()
+            LAST_FAILURE.update(phase=label, error_type=type(error).__name__, http_status=status if type(status) is int else None)
+        raise RelayFailure(label) from None
+
+def mirror_descriptor():
+    path = Path(__file__).with_name(MIRROR_FILE)
+    require(path.is_file() and (not path.is_symlink()) and (0 < path.stat().st_size <= 8192))
+    descriptor = parse_object(path.read_bytes(), {'schema', 'diagnostic_id', 'repository', 'release_id', 'asset_id', 'name', 'tag', 'target_commitish', 'bytes', 'sha256'})
+    require(descriptor['schema'] == 1 and descriptor['diagnostic_id'] == 'lightbox-diag3927' and (descriptor['repository'] == REPOSITORY) and (descriptor['name'] == 'lightbox-input-aesgcm.bin') and (type(descriptor['release_id']) is int) and (descriptor['release_id'] > 0) and (type(descriptor['asset_id']) is int) and (descriptor['asset_id'] > 0) and (type(descriptor['bytes']) is int) and (28 < descriptor['bytes'] < 16 * 1024 ** 2) and matches(descriptor['sha256'], '[a-f0-9]{64}') and matches(descriptor['target_commitish'], '[a-f0-9]{40}') and matches(descriptor['tag'], 'lightbox-diag3927-cipher-mirror-[a-f0-9]{12}'))
+    return descriptor
+
+def read_mirror_release(token, descriptor):
+    request = urllib.request.Request(f"https://api.github.com/repos/{REPOSITORY}/releases/{descriptor['release_id']}", headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'SortAI-Lightbox-Diagnostic'})
+    with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
+        raw = response.read(128 * 1024 + 1)
+        require(response.status == 200 and len(raw) <= 128 * 1024)
+    release = json.loads(raw, object_pairs_hook=unique_object)
+    require(release.get('id') == descriptor['release_id'] and release.get('draft') is True and (release.get('prerelease') is True) and (release.get('published_at') is None) and (release.get('tag_name') == descriptor['tag']) and (release.get('target_commitish') == descriptor['target_commitish']) and (len(release.get('assets', [])) == 1))
+    asset, = release['assets']
+    require(asset.get('id') == descriptor['asset_id'] and asset.get('name') == descriptor['name'] and (asset.get('state') == 'uploaded') and (asset.get('size') == descriptor['bytes']) and (asset.get('digest') == 'sha256:' + descriptor['sha256']))
+
+def download_mirror(token, descriptor, destination):
+    request = urllib.request.Request(f"https://api.github.com/repos/{REPOSITORY}/releases/assets/{descriptor['asset_id']}", headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/octet-stream', 'X-GitHub-Api-Version': '2026-03-10', 'User-Agent': 'SortAI-Lightbox-Diagnostic'})
+    try:
+        response = urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        if error.code != 302:
+            raise
+        with error:
+            location = error.headers.get('Location', '')
+        target = urllib.parse.urlsplit(location)
+        require(target.scheme == 'https' and target.hostname in CDN_HOSTS and (target.port in (None, 443)) and (target.username is None) and (target.password is None) and bool(target.query) and (not target.fragment))
+        anonymous = urllib.request.Request(location, headers={'Accept-Encoding': 'identity', 'User-Agent': 'SortAI-Lightbox-Diagnostic'})
+        response = urllib.request.build_opener(NoRedirect()).open(anonymous, timeout=60)
+    received = 0
+    checksum = hashlib.sha256()
+    with response:
+        declared = response.headers.get('Content-Length')
+        require(response.status == 200 and response.headers.get('Content-Encoding') in (None, 'identity') and (declared is None or (declared.isdecimal() and int(declared) == descriptor['bytes'])))
+        with destination.open('xb') as output:
+            for chunk in iter(lambda: response.read(CHUNK), b''):
+                received += len(chunk)
+                require(received <= descriptor['bytes'])
+                checksum.update(chunk)
+                output.write(chunk)
+    require(received == descriptor['bytes'] and checksum.hexdigest() == descriptor['sha256'])
+
+def receive(secret, destination):
+    require(0 < len(secret) <= 16000)
+    info = parse_object(secret, {'url', 'sha256', 'key'})
+    require(matches(info['key'], '[a-fA-F0-9]{64}') and matches(info['sha256'], '[a-f0-9]{64}'))
+    info.pop('url')
+    descriptor = mirror_descriptor()
+    require(info['sha256'] == descriptor['sha256'])
+    token = os.environ.pop('GH_TOKEN', '')
+    require(isinstance(token, str) and 0 < len(token) <= 4096)
+    read_mirror_release(token, descriptor)
+    download_mirror(token, descriptor, destination)
+    del token
+    MIRROR_VERIFIED.clear()
+    MIRROR_VERIFIED.update(descriptor)
+    return bytes.fromhex(info['key'])
 'Diagnostic-only worker body appended to the reviewed encrypted transport.'
 DIAGNOSTIC_ID = 'lightbox-diag3927'
 PROBE_NAME = 'lightbox_probe3927.py'
@@ -210,6 +251,7 @@ def run_diagnostic(temp, run_id, attempt, workflow_commit):
         scratch = Path(name)
         log = scratch / 'diagnostic.log'
         log.touch(mode=384)
+        log.write_text(json.dumps({'diagnostic_id': DIAGNOSTIC_ID, 'phase': 'startup', 'run_id': run_id, 'run_attempt': attempt, 'workflow_commit': workflow_commit}, separators=(',', ':')) + '\n', encoding='utf8')
         encrypted = scratch / 'job.enc'
         bundle = scratch / 'job.zip'
         source = scratch / 'source'
@@ -258,13 +300,25 @@ def run_diagnostic(temp, run_id, attempt, workflow_commit):
                     entry.update(tests=sum((value['tests'] for value in report['runs'])), failures=sum((value['failures'] for value in report['runs'])), errors=sum((value['errors'] for value in report['runs'])), report_sha256=file_digest(report_path))
                 results.append(entry)
             after = {name: file_digest(source / name) for name in before}
-            proof = {'ok': True, 'diagnostic_id': DIAGNOSTIC_ID, 'version': VERSION, 'source_commit': job['source_commit'], 'source_archive_sha256': source_archive_sha, 'probe_sha256': job['probe_sha256'], 'nonce': job['nonce'], 'run_id': run_id, 'run_attempt': attempt, 'workflow_commit': workflow_commit, 'source_tree_before': fingerprint(before), 'source_tree_after': fingerprint(after), 'source_unchanged': before == after, 'changed_source_paths': [name for name in before if before[name] != after[name]], 'results': results, 'deliverable_built': False, 'feed_published': False, 'cursor_control': False}
+            proof = {'ok': True, 'diagnostic_id': DIAGNOSTIC_ID, 'version': VERSION, 'source_commit': job['source_commit'], 'source_archive_sha256': source_archive_sha, 'probe_sha256': job['probe_sha256'], 'nonce': job['nonce'], 'ciphertext_mirror': dict(MIRROR_VERIFIED), 'run_id': run_id, 'run_attempt': attempt, 'workflow_commit': workflow_commit, 'source_tree_before': fingerprint(before), 'source_tree_after': fingerprint(after), 'source_unchanged': before == after, 'changed_source_paths': [name for name in before if before[name] != after[name]], 'results': results, 'deliverable_built': False, 'feed_published': False, 'cursor_control': False}
             with log.open('ab') as stream:
                 stream.write(('\nLIGHTBOX_DIAGNOSTIC_BINDING ' + json.dumps(proof, separators=(',', ':')) + '\n').encode())
             require(before == after)
             print('Diagnostic reports captured; all private output remains encrypted.', flush=True)
+        except BaseException as error:
+            failure = dict(LAST_FAILURE) if LAST_FAILURE else {'phase': 'diagnostic-worker', 'error_type': type(error).__name__, 'http_status': None}
+            with log.open('ab') as stream:
+                stream.write(('LIGHTBOX_DIAGNOSTIC_STARTUP_FAILURE ' + json.dumps(failure, separators=(',', ':')) + '\n').encode())
+            raise
         finally:
-            phase('Seal the bounded diagnostic output', seal_diagnostic, log, work / DIAGNOSTIC_NAME)
+            original_failure = sys.exc_info()[0] is not None
+            print('Seal the bounded diagnostic output', flush=True)
+            try:
+                seal_diagnostic(log, work / DIAGNOSTIC_NAME)
+            except Exception as seal_error:
+                print('::error::Diagnostic sealing failed: ' + type(seal_error).__name__, file=sys.stderr)
+                if not original_failure:
+                    raise RelayFailure('Seal the bounded diagnostic output') from None
 
 def upload_diagnostic(temp, run_id, attempt, workflow_commit):
     work = temp / f'sortai-lightbox-diag3927-{run_id}-{attempt}'

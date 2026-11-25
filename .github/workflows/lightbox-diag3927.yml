@@ -31,6 +31,7 @@ jobs:
         id: diag
         env:
           SORTAI_LIGHTBOX_DIAG3927: ${{ secrets.SORTAI_LIGHTBOX_DIAG3927 }}
+          GH_TOKEN: ${{ github.token }}
         run: python .github/qa/lightbox_diag3927_worker.py run
       - name: Preserve only the encrypted diagnostic
         if: ${{ always() && steps.diag.outcome != 'skipped' }}
